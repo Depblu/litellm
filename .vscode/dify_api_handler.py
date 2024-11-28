@@ -1,13 +1,17 @@
 import litellm
 from litellm import CustomLLM
 import time
-
-
+import re
+import base64
+from uuid import uuid4
 import json
 import requests
 import os
 from enum import Enum
 from fastapi.responses import StreamingResponse
+
+from typing import Iterator, AsyncIterator
+from litellm.types.utils import GenericStreamingChunk, ModelResponse
 
 
 from pydantic import BaseModel
@@ -244,8 +248,61 @@ def call_dify_api(api_key: str, query: str, response_mode: ResponseMode, user: s
         raise DifyAPIError(f"不支持的响应模式: {response_mode}")
 
 
+def pre_process_messages(messages: List[dict], file_tmp_dir: str) -> tuple[str, List[str]]:
+    """
+    处理消息列表，提取文本内容并保存图片文件
+    
+    Args:
+        messages (List[dict]): 消息列表
+        file_tmp_dir (str): 临时文件目录路径
+        
+    Returns:
+        tuple[str, List[str]]: 返回处理后的查询文本和文件路径列表
+    """
+    files = []
+    dify_messages = []
+    
+    for message in messages:
+        if message["role"] == "user":
+            if isinstance(message["content"], list):
+                new_content = []
+                for content in message["content"]:
+                    if content["type"] == "text":
+                        new_content.append(content["text"])
+                    elif content["type"] == "image_url":
+                        image_url = content["image_url"]["url"]
+                        if re.match(r"data:image/.*;base64,", image_url):
+                            # 解码base64图像
+                            image_data = base64.b64decode(image_url.split(",")[1])
+                            # 提取扩展名
+                            extension = image_url.split(";")[0].split("/")[1]
+                            file_path = os.path.join(file_tmp_dir, f"{uuid4()}.{extension}")
+                            
+                            # 保存图像到文件
+                            with open(file_path, "wb") as f:
+                                f.write(image_data)
+                            
+                            files.append(file_path)
+                # 重组消息内容
+                message["content"] = " ".join(new_content)
+        dify_messages.append(message)
+    
+    #query = " ".join([msg["content"] for msg in dify_messages if msg["role"] == "user"]).strip()
+    query = str(dify_messages)
+    return query, files
 
 
+def post_process_messages(file_tmp_dir: str, files: List[str]):
+    """
+    删除保存的临时文件
+    
+    Args:
+        files (List[str]): 文件路径列表
+        file_tmp_dir (str): 临时文件目录路径
+    """
+    for file in files:
+        if os.path.exists(file):
+            os.remove(file)
 
 
 
@@ -339,57 +396,21 @@ class DifyLLM(CustomLLM):
             raise Exception(f"Dify API 调用失败: {str(e)}")
 
     async def acompletion(self, *args, **kwargs) -> litellm.ModelResponse:
+        # 从kwargs中获取必要参数
         file_tmp_dir = kwargs.get("optional_params", {}).get("file_tmp_dir")
         api_base_url = kwargs.get("litellm_params", {}).get("api_base", "http://10.144.129.132/v1")
         api_key = kwargs.get("litellm_params", {}).get("api_key")
         model_response = kwargs.get("model_response", litellm.ModelResponse())
-        # 从kwargs中获取必要参数
         messages = kwargs.get("messages", [])
         stream = False
         user = kwargs.get("user", "default_user")
         
-        # 构建查询文本 - 获取最后一条用户消息
-        files = []
-        dify_messages = []
-        for message in messages:
-            if message["role"] == "user":
-                if isinstance(message["content"], list):
-                    new_content = []
-                    for content in message["content"]:
-                        if content["type"] == "text":
-                            new_content.append(content["text"])
-                        elif content["type"] == "image_url":
-                            image_url = content["image_url"]["url"]
-                            import re
-                            if re.match(r"data:image/.*;base64,", image_url):
-                                import base64
-                                import os
-                                from uuid import uuid4
-                                
-                                # 解码base64图像
-                                image_data = base64.b64decode(image_url.split(",")[1])
-                                # 提取扩展名
-                                extension = image_url.split(";")[0].split("/")[1]
-                                file_path = os.path.join(file_tmp_dir, f"{uuid4()}.{extension}")
-                                
-                                # 保存图像到文件
-                                with open(file_path, "wb") as f:
-                                    f.write(image_data)
-                                
-                                # 将文件路径追加到files列表
-                                files.append(file_path)
-                    # 重组消息内容
-                    message["content"] = " ".join(new_content)
-            dify_messages.append(message)
+        # 构建查询文本和文件路径列表
+        query, files = pre_process_messages(messages, file_tmp_dir)
         
-        # 将重组后的消息转成字符串保存在query中
-        #query = " ".join([msg["content"] for msg in dify_messages if msg["role"] == "user"]).strip()
-        query = str(dify_messages)
         # 设置响应模式
         response_mode = ResponseMode.STREAMING if stream else ResponseMode.BLOCKING
         
-        
-        print(f"query: {query}")
         try:
             # 调用 Dify API
             response = call_dify_api(
@@ -399,7 +420,7 @@ class DifyLLM(CustomLLM):
                 user=user,
                 files=files
             )
-            
+            post_process_messages(file_tmp_dir, files)
             
             # 将 Dify 响应转换为 ModelResponse 格式
             if isinstance(response, dict):
@@ -423,6 +444,9 @@ class DifyLLM(CustomLLM):
                 return response
                 
         except Exception as e:
+            post_process_messages(file_tmp_dir, files)
             raise Exception(f"Dify API 调用失败: {str(e)}")
+        
+
 
 dify_api_llm = DifyLLM()
