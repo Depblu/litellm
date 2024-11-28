@@ -1,0 +1,22 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Run proxy_cli.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/litellm/proxy/proxy_cli.py",
+            "console": "integratedTerminal",
+            "args": [
+                "-c", "${workspaceFolder}/.vscode/config.yaml",
+                "--debug",
+                "--port", "4000"
+            ],
+            "env": {
+                "HTTP_PROXY": "http://127.0.0.1:7890",
+                "HTTPS_PROXY": "http://127.0.0.1:7890"
+            },
+            "justMyCode": false
+        }
+    ]
+}

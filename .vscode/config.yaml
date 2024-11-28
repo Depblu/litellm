@@ -1,0 +1,20 @@
+model_list:
+  - model_name: poll_gemini-1.5-flash-latest
+    litellm_params:
+      model: gemini/gemini-1.5-flash-latest
+      api_key: AIzaSyCj3mL5NhVxX_bQoSChsvqamXURkJLFgnY
+      rpm: 15
+      tpm: 1000000
+    model_info:
+      id: liu31381
+  - model_name: "dify_api-jinchat"
+    litellm_params:
+      model: "dify_api/jinchat"
+      api_base: "http://10.144.129.132/v1"
+      api_key: "app-KAQhWhzyPsBZmlpb0qcyzJcM"
+      file_tmp_dir: "/mnt/difytmpfs"  # 👈 CUSTOM PARAM
+
+litellm_settings:
+  set_verbose: true 
+  custom_provider_map:
+    - {"provider": "dify_api", "custom_handler": dify_api_handler.dify_api_llm}
