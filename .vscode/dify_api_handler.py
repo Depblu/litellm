@@ -16,7 +16,8 @@ from litellm.types.utils import GenericStreamingChunk, ModelResponse
 
 from pydantic import BaseModel
 from typing import List, Optional
-
+import itertools
+import httpx
 
 
 class ChatRequest(BaseModel):
@@ -185,33 +186,60 @@ def handle_blocking_response(headers: dict, payload: dict, chat_messages_url: st
     }
 
 
-def handle_streaming_response(headers: dict, payload: dict, chat_messages_url: str):
+# async def handle_streaming_response(headers: dict, payload: dict, chat_messages_url: str):
+#     """
+#     处理流式响应
+#     """
+#     #client = httpx.AsyncClient()
+    
+#     response = requests.post(chat_messages_url, headers=headers, json=payload, stream=True)
+#     #response = client.stream("POST", chat_messages_url, headers=headers, json=payload)
+#     dify_api_error_handler(response)
+
+#     buffer = ""
+#     for chunk in response.iter_content(chunk_size=32):
+#         if chunk:
+#             buffer += chunk.decode('utf-8')
+#             while '\n' in buffer:
+#                 line, buffer = buffer.split('\n', 1)
+#                 line = line.strip()
+#                 if not line:
+#                     continue
+#                 if line.startswith('data: '):
+#                     line = line[6:]
+#                 try:
+#                     data = json.loads(line)
+#                     if (data['event'] == 'message' and 'answer' in data) or data['event'] == 'message_end':
+#                         #yield f"data: {json.dumps({'choices': [{'delta': {'content': data['answer']}}]})}\n\n"
+#                         yield data
+#                 except json.JSONDecodeError:
+#                     continue
+
+async def handle_streaming_response(headers: dict, payload: dict, chat_messages_url: str):
     """
     处理流式响应
     """
-    response = requests.post(chat_messages_url, headers=headers, json=payload, stream=True)
-    dify_api_error_handler(response)
+    async with httpx.AsyncClient() as client:
+        async with client.stream("POST", chat_messages_url, headers=headers, json=payload) as response:
+            dify_api_error_handler(response)
 
-    def event_stream():
-        buffer = ""
-        for chunk in response.iter_content(chunk_size=32):
-            if chunk:
-                buffer += chunk.decode('utf-8')
-                while '\n' in buffer:
-                    line, buffer = buffer.split('\n', 1)
-                    line = line.strip()
-                    if not line:
-                        continue
-                    if line.startswith('data: '):
-                        line = line[6:]
-                    try:
-                        data = json.loads(line)
-                        if data['event'] == 'message' and 'answer' in data:
-                            yield f"data: {json.dumps({'choices': [{'delta': {'content': data['answer']}}]})}\n\n"
-                    except json.JSONDecodeError:
-                        continue
-
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+            buffer = ""
+            async for chunk in response.aiter_bytes():
+                if chunk:
+                    buffer += chunk.decode('utf-8')
+                    while '\n' in buffer:
+                        line, buffer = buffer.split('\n', 1)
+                        line = line.strip()
+                        if not line:
+                            continue
+                        if line.startswith('data: '):
+                            line = line[6:]
+                        try:
+                            data = json.loads(line)
+                            if (data['event'] == 'message' and 'answer' in data) or data['event'] == 'message_end':
+                                yield data
+                        except json.JSONDecodeError:
+                            continue
 
 
 def call_dify_api(api_key: str, query: str, response_mode: ResponseMode, user: str, 
@@ -248,6 +276,60 @@ def call_dify_api(api_key: str, query: str, response_mode: ResponseMode, user: s
         raise DifyAPIError(f"不支持的响应模式: {response_mode}")
 
 
+async def call_dify_api_streaming(api_key: str, query: str, response_mode: ResponseMode, user: str, 
+                  files: list[str] = None, conversation_id: str = None,
+                  inputs: dict = None, auto_generate_name: bool = True, 
+                  api_base_url: str = 'http://10.144.129.132/v1') -> AsyncIterator[GenericStreamingChunk]:
+    """
+    调用 Dify API 的主函数
+    
+    参数:
+        api_key (str): API 密钥，用于授权
+        query (str): 用户的查询或消息内容
+        response_mode (ResponseMode): 响应模式（STREAMING 或 BLOCKING）
+        user (str): 用户标识
+        files (list[str], optional): 要上传的本地文件路径列表
+        conversation_id (str, optional): 会话ID
+        inputs (dict, optional): 额外的输入参数
+        auto_generate_name (bool, optional): 是否自动生成标题
+        api_base_url (str, optional): API的基础URL
+
+    返回:
+        str: API的响应内容
+    """
+    headers, payload, chat_messages_url = prepare_chat_request(
+        api_key, query, response_mode, user, files, 
+        conversation_id, inputs, auto_generate_name, api_base_url
+    )
+    
+    chunks = handle_streaming_response(headers, payload, chat_messages_url)
+    idx = 0
+    async for chunk in chunks:
+        finish_flag = chunk.get("event") == "message_end"
+        completion_tokens = 0
+        prompt_tokens = 0
+        total_tokens = 0
+        if finish_flag == True:
+            completion_tokens = chunk.get("metadata", {}).get("usage", {}).get("completion_tokens", 0)
+            prompt_tokens = chunk.get("metadata", {}).get("usage", {}).get("prompt_tokens", 0)
+            total_tokens = chunk.get("metadata", {}).get("usage", {}).get("total_tokens", 0)
+        
+        generic_streaming_chunk: GenericStreamingChunk = {
+            "finish_reason": "stop" if finish_flag == True else None,
+            "index": idx,
+            "is_finished": finish_flag,
+            "text": chunk.get("answer", ""),
+            "tool_use": None,
+            "usage": {"completion_tokens": completion_tokens, "prompt_tokens": prompt_tokens, "total_tokens": total_tokens},
+        }
+        
+        yield generic_streaming_chunk # type: ignore
+        
+        idx += 1
+
+
+
+
 def pre_process_messages(messages: List[dict], file_tmp_dir: str) -> tuple[str, List[str]]:
     """
     处理消息列表，提取文本内容并保存图片文件
@@ -257,7 +339,7 @@ def pre_process_messages(messages: List[dict], file_tmp_dir: str) -> tuple[str, 
         file_tmp_dir (str): 临时文件目录路径
         
     Returns:
-        tuple[str, List[str]]: 返回处理后的查询文本和文件路径列表
+        tuple[str, List[str]]: 返回处���后的查询文本和文件路径列表
     """
     files = []
     dify_messages = []
@@ -292,21 +374,31 @@ def pre_process_messages(messages: List[dict], file_tmp_dir: str) -> tuple[str, 
     return query, files
 
 
-def post_process_messages(file_tmp_dir: str, files: List[str]):
-    """
-    删除保存的临时文件
-    
-    Args:
-        files (List[str]): 文件路径列表
-        file_tmp_dir (str): 临时文件目录路径
-    """
+def post_process_messages(files: List[str]):
     for file in files:
         if os.path.exists(file):
             os.remove(file)
 
 
-
 class DifyLLM(CustomLLM):
+    
+    def __init__(self):
+        self.total_files = []
+        super().__init__()
+    
+    def __clear_files(self):
+        for file in self.total_files:
+            if os.path.exists(file):
+                os.remove(file)
+        self.total_files = []
+        
+    def __exit__(self):
+        self.__clear_files()
+        super().__exit__()
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self.__clear_files()
+        await super().__aexit__(exc_type, exc_val, exc_tb)
     
     def completion(self, *args, **kwargs) -> litellm.ModelResponse:
         return litellm.completion(
@@ -314,86 +406,63 @@ class DifyLLM(CustomLLM):
             messages=[{"role": "user", "content": "Hello world"}],
             mock_response="Hi!",
         )  # type: ignore
-    def streaming(self, *args, **kwargs) -> litellm.ModelResponse:
-        return litellm.completion(
-            model="poll_gemini-1.5-flash-latest",
-            messages=[{"role": "user", "content": "Hello world"}],
-            mock_response="Hi!",
-        )  # type: ignore
         
-    async def astreaming(self, *args, **kwargs) -> litellm.ModelResponse:
-        file_tmp_dir = kwargs.get("litellm_params", {}).get("file_tmp_dir")
+    def streaming(self, *args, **kwargs) -> Iterator[GenericStreamingChunk]:
+        generic_streaming_chunk: GenericStreamingChunk = {
+            "finish_reason": "stop",
+            "index": 0,
+            "is_finished": True,
+            "text": str(int(time.time())),
+            "tool_use": None,
+            "usage": {"completion_tokens": 0, "prompt_tokens": 0, "total_tokens": 0},
+        }
+        return generic_streaming_chunk # type: ignore
+        
+    async def astreaming(self, *args, **kwargs) -> AsyncIterator[GenericStreamingChunk]:
+        # generic_streaming_chunk: GenericStreamingChunk = {
+        #     "finish_reason": "stop",
+        #     "index": 0,
+        #     "is_finished": True,
+        #     "text": str(int(time.time())),
+        #     "tool_use": None,
+        #     "usage": {"completion_tokens": 0, "prompt_tokens": 0, "total_tokens": 0},
+        # }
+        # yield generic_streaming_chunk # type: ignore
+        
+        # 从kwargs中获取必要参数
+        file_tmp_dir = kwargs.get("optional_params", {}).get("file_tmp_dir")
         api_base_url = kwargs.get("litellm_params", {}).get("api_base", "http://10.144.129.132/v1")
         api_key = kwargs.get("litellm_params", {}).get("api_key")
-        # 从kwargs中获取必要参数
+        model_response = kwargs.get("model_response", litellm.ModelResponse())
         messages = kwargs.get("messages", [])
-        stream = True
         user = kwargs.get("user", "default_user")
         
-        # 构建查询文本 - 获取最后一条用户消息
-        files = []
-        dify_messages = []
-        for message in messages:
-            if message["role"] == "user":
-                if isinstance(message["content"], list):
-                    new_content = []
-                    for content in message["content"]:
-                        if content["type"] == "text":
-                            new_content.append(content["text"])
-                        elif content["type"] == "image_url":
-                            image_url = content["image_url"]["url"]
-                            import re
-                            if re.match(r"data:image/.*;base64,", image_url):
-                                import base64
-                                import os
-                                from uuid import uuid4
-                                
-                                # 解码base64图像
-                                image_data = base64.b64decode(image_url.split(",")[1])
-                                # 提取扩展名
-                                extension = image_url.split(";")[0].split("/")[1]
-                                file_path = os.path.join(file_tmp_dir, f"{uuid4()}.{extension}")
-                                
-                                # 保存图像到文件
-                                with open(file_path, "wb") as f:
-                                    f.write(image_data)
-                                
-                                # 将文件路径追加到files列表
-                                files.append(file_path)
-                    # 重组消息内容
-                    message["content"] = " ".join(new_content)
-            dify_messages.append(message)
+        # 构建查询文本和文件路径列表
+        query, files = pre_process_messages(messages, file_tmp_dir)
         
-        # 将重组后的消息转成字符串保存在query中
-        query = " ".join([msg["content"] for msg in dify_messages if msg["role"] == "user"]).strip()
         # 设置响应模式
-        response_mode = ResponseMode.STREAMING if stream else ResponseMode.BLOCKING
+        response_mode = ResponseMode.STREAMING
         
-        
-        print(f"query: {query}")
         try:
             # 调用 Dify API
-            response = await call_dify_api(
+            response = call_dify_api_streaming(
                 api_key=api_key,
                 query=query,
                 response_mode=response_mode,
-                user=user
+                user=user,
+                files=files
             )
             
-            # 将 Dify 响应转换为 ModelResponse 格式
-            if isinstance(response, dict):
-                return litellm.ModelResponse(
-                    id=response.get("id", ""),
-                    choices=response.get("choices", []),
-                    model=kwargs.get("model", "dify"),
-                    usage=response.get("usage", {})
-                )
-            else:
-                # 处理流式响应
-                return response
+            async for chunk in response:
+                yield chunk
                 
         except Exception as e:
+            #post_process_messages(files)
             raise Exception(f"Dify API 调用失败: {str(e)}")
+        finally:
+            post_process_messages(files)
+        
+        
 
     async def acompletion(self, *args, **kwargs) -> litellm.ModelResponse:
         # 从kwargs中获取必要参数
@@ -420,7 +489,6 @@ class DifyLLM(CustomLLM):
                 user=user,
                 files=files
             )
-            post_process_messages(file_tmp_dir, files)
             
             # 将 Dify 响应转换为 ModelResponse 格式
             if isinstance(response, dict):
@@ -444,8 +512,10 @@ class DifyLLM(CustomLLM):
                 return response
                 
         except Exception as e:
-            post_process_messages(file_tmp_dir, files)
+            post_process_messages(files)
             raise Exception(f"Dify API 调用失败: {str(e)}")
+        finally:
+            post_process_messages(files)
         
 
 
