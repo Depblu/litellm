@@ -11,7 +11,7 @@ model_list:
     litellm_params:
       model: "dify_api/jinchat"
       api_base: "http://10.144.129.132/v1"
-      api_key: "app-KAQhWhzyPsBZmlpb0qcyzJcM"
+      api_key: "app-c5oA5x1djiBnaKmVvaJNEzOw"
       file_tmp_dir: "/mnt/difytmpfs"  # 👈 CUSTOM PARAM
 
 litellm_settings:

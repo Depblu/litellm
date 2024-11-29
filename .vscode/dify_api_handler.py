@@ -243,7 +243,7 @@ async def handle_streaming_response(headers: dict, payload: dict, chat_messages_
                             line = line[6:]
                         try:
                             data = json.loads(line)
-                            if (data['event'] == 'message' and 'answer' in data) or data['event'] == 'message_end':
+                            if ((data['event'] == 'message' or data['event'] == 'agent_message') and 'answer' in data) or data['event'] == 'message_end':
                                 yield data
                         except json.JSONDecodeError:
                             continue
