@@ -219,9 +219,16 @@ async def handle_streaming_response(headers: dict, payload: dict, chat_messages_
     """
     处理流式响应
     """
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=60) as client:
         async with client.stream("POST", chat_messages_url, headers=headers, json=payload) as response:
-            dify_api_error_handler(response)
+            # 检查响应状态码
+            if response.status_code != 200:
+                # 读取错误响应内容
+                error_content = await response.aread()
+                error_info = json.loads(error_content)
+                error_code = error_info.get('code', 'unknown_error')
+                error_message = error_info.get('message', '未知错误')
+                raise DifyAPIError(f"发送聊天消息失败: {error_code} - {error_message}")
 
             buffer = ""
             async for chunk in response.aiter_bytes():
@@ -339,7 +346,7 @@ def pre_process_messages(messages: List[dict], file_tmp_dir: str) -> tuple[str, 
         file_tmp_dir (str): 临时文件目录路径
         
     Returns:
-        tuple[str, List[str]]: 返回处���后的查询文本和文件路径列表
+        tuple[str, List[str]]: 返回处理后的查询文本和文件路径列表
     """
     files = []
     dify_messages = []
